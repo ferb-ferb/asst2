@@ -552,8 +552,8 @@ __global__ void kernelCalcCircleOverlaps(){
 
       if (circleInBox(p.x, p.y , rad, boxL, boxR, boxT, boxB)) {
         int binIdx = j * cuConstRendererParams.binsX + i;
-        printf("Circle: (%.2f,%.2f,%.2f) determined to be in bin: (%d,%d) in image size: (%d,%d)\n",
-            p.x,p.y,rad,i,j,cuConstRendererParams.imageWidth,cuConstRendererParams.imageHeight);
+        // printf("Circle: (%.2f,%.2f,%.2f) determined to be in bin: (%d,%d) in image size: (%d,%d)\n",
+        //     p.x,p.y,rad,i,j,cuConstRendererParams.imageWidth,cuConstRendererParams.imageHeight);
         // Use atomicAdd because multiple circles might hit the same bin
         atomicAdd(&cuConstRendererParams.BinCircCounts[binIdx], 1);
       }
@@ -812,8 +812,8 @@ CudaRenderer::render() {
     // kernelRenderCircles<<<gridDim, blockDim>>>();
     // cudaDeviceSynchronize();
     //Fits in register file, warp aligned  -- Also see 653:654
-    dim3 blockDim(3);
-    dim3 gridDim(1);
+    dim3 blockDim(256);
+    dim3 gridDim((numberOfCircles + 255) / 256);
     kernelCalcCircleOverlaps<<<gridDim,blockDim>>>();
     cudaDeviceSynchronize();
     thrust::exclusive_scan(thrust::device, 
