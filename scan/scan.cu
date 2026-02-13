@@ -29,20 +29,43 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void upsweep(int* device_data, int twod, int N){
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  if(x >= N) return; 
+  int stride = twod*2;
+  int index = (stride*(x+1)) -1 ; 
+  device_data[index] += device_data[index - twod];
+}
+
+__global__ void downsweep(int* device_data, int twod, int N){
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  if(x >= N) return; 
+  int start = twod*2;
+  int index = (start*(x+1))-1; 
+  int temp = device_data[index];
+  device_data[index] += device_data[index - twod];
+  device_data[index - twod] = temp; 
+}
+
 void exclusive_scan(int* device_data, int length)
 {
-    /* TODO
-     * Fill in this function with your exclusive scan implementation.
-     * You are passed the locations of the data in device memory
-     * The data are initialized to the inputs.  Your code should
-     * do an in-place scan, generating the results in the same array.
-     * This is host code -- you will need to declare one or more CUDA
-     * kernels (with the __global__ decorator) in order to actually run code
-     * in parallel on the GPU.
-     * Note you are given the real length of the array, but may assume that
-     * both the data array is sized to accommodate the next
-     * power of 2 larger than the input.
-     */
+  const int BLOCKSIZE = 64;
+  int N = nextPow2(length);
+  //upsweep phase 
+  for(int twod = 1; twod<length; twod*=2){
+    int num_threads = N / (twod*2);
+    int num_blocks = (num_threads + BLOCKSIZE - 1) / BLOCKSIZE;
+    upsweep<<<num_blocks, BLOCKSIZE>>>(device_data, twod, num_threads);
+    cudaDeviceSynchronize();
+  }
+  cudaMemset(&device_data[N-1], 0, sizeof(int));
+  // downsweep phase.
+  for (int twod = N/2; twod >= 1; twod /= 2){
+    int num_threads = N / (twod*2);
+    int num_blocks = (num_threads + BLOCKSIZE - 1) / BLOCKSIZE;
+    downsweep<<<num_blocks, BLOCKSIZE>>>(device_data, twod, num_threads);
+    cudaDeviceSynchronize();
+  }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -108,6 +131,24 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void _peakMapper(int* device_input, int* peakmap, int N){
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  if(x>=N) return; 
+  const uint index = x + 1;
+  if((device_input[index] > device_input[index-1]) && (device_input[index] > device_input[index+1])){
+    peakmap[index] = 1;
+  }
+  else{peakmap[index]=0;}
+}
+
+__global__ void _outWriter(int* device_input, int* peakmap, int* device_output, int N){
+  const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+  if(x>=N) return; 
+  const uint index = x + 1;
+  if((device_input[index] > device_input[index-1]) && (device_input[index] > device_input[index+1])){
+    device_output[peakmap[index]] = index;
+  }
+ }
 
 
 int find_peaks(int *device_input, int length, int *device_output) {
@@ -125,7 +166,19 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
+    int N = nextPow2(length);
+    int* _peakmap;
+    cudaMalloc(&_peakmap, N * sizeof(int));
+    cudaMemset(_peakmap, 0, sizeof(int)*N);
+    const int BLOCKSIZE = 128;
+    int num_threads = length-2;
+    int num_blocks = (num_threads + BLOCKSIZE - 1)/BLOCKSIZE;
+    _peakMapper<<<num_blocks,BLOCKSIZE>>>(device_input, _peakmap, num_threads);
+    exclusive_scan(_peakmap, N);
+    _outWriter<<<num_blocks,BLOCKSIZE>>>(device_input, _peakmap, device_output, num_threads);
+    int last_scan_val;
+    cudaMemcpy(&last_scan_val, &_peakmap[length-1], sizeof(int), cudaMemcpyDeviceToHost);
+    return last_scan_val;
 }
 
 

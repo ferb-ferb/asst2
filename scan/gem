@@ -1,0 +1,115 @@
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <cmath>
+#include <algorithm>
+
+// ==========================================
+// Kernel Definitions
+// ==========================================
+
+// Upsweep: Performs a parallel reduction summing up the tree
+// two_d: The current power of 2 stride (2^d)
+__global__ void upsweep_kernel(int* device_data, int two_d) {
+    // Calculate global thread index
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Calculate the indices for the left and right children in the tree
+    // The stride between elements is 2^(d+1), which is 2 * two_d
+    int stride = two_d * 2;
+    
+    // Map thread index to the actual data location
+    // We process indices: 0, 1*stride, 2*stride...
+    int my_idx = index * stride;
+    
+    // Determine the indices to operate on
+    int left = my_idx + two_d - 1;
+    int right = my_idx + stride - 1;
+    
+    // Boundary check is implicitly handled by the grid launch size 
+    // passed from the host, but ensures we don't access OOB memory
+    // (Note: The host ensures we only launch threads for valid pairs)
+    
+    device_data[right] += device_data[left];
+}
+
+// Downsweep: Traverses down, swapping and adding to build scan
+__global__ void downsweep_kernel(int* device_data, int two_d) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = two_d * 2;
+    
+    int my_idx = index * stride;
+    
+    int left = my_idx + two_d - 1;
+    int right = my_idx + stride - 1;
+    
+    // Store the left value
+    int t = device_data[left];
+    
+    // Swap: Left gets the value of Right
+    device_data[left] = device_data[right];
+    
+    // Add: Right becomes Old_Left + Old_Right
+    device_data[right] += t;
+}
+
+// Helper to set a specific index to zero (needed for the root)
+__global__ void set_zero(int* device_data, int index) {
+    device_data[index] = 0;
+}
+
+// ==========================================
+// Host Code
+// ==========================================
+
+// Helper to find next power of 2
+int next_power_of_two(int x) {
+    int power = 1;
+    while (power < x) {
+        power *= 2;
+    }
+    return power;
+}
+
+void exclusive_scan(int* device_data, int length)
+{
+    // 1. Calculate the padded length (N)
+    // The algorithm requires the array size to be a power of 2.
+    // The prompt states the array is already sized to accommodate this.
+    int N = next_power_of_two(length);
+    
+    // Constants for kernel configuration
+    const int BLOCK_SIZE = 256;
+    
+    // ============================
+    // Phase 1: Upsweep (Reduce)
+    // ============================
+    // Iterate d from 0 to log2(N) - 1
+    // two_d represents 2^d
+    for (int two_d = 1; two_d < N; two_d *= 2) {
+        // At every level, the number of operations halves.
+        int num_threads = N / (two_d * 2);
+        int num_blocks = (num_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        
+        upsweep_kernel<<<num_blocks, BLOCK_SIZE>>>(device_data, two_d);
+        cudaDeviceSynchronize(); // Ensure level completes before next
+    }
+
+    // ============================
+    // Phase 2: Set Root to Zero
+    // ============================
+    // For exclusive scan, we set the last element (total sum) to 0 before downsweep.
+    set_zero<<<1, 1>>>(device_data, N - 1);
+    cudaDeviceSynchronize();
+
+    // ============================
+    // Phase 3: Downsweep
+    // ============================
+    // Iterate d from log2(N)-1 down to 0
+    for (int two_d = N / 2; two_d >= 1; two_d /= 2) {
+        int num_threads = N / (two_d * 2);
+        int num_blocks = (num_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        
+        downsweep_kernel<<<num_blocks, BLOCK_SIZE>>>(device_data, two_d);
+        cudaDeviceSynchronize();
+    }
+}
