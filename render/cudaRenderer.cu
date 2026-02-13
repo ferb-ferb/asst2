@@ -1,11 +1,13 @@
 #include <string>
+#include <thrust/execution_policy.h>
 #include <algorithm>
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include <stdio.h>
 #include <vector>
 
-
+#include <thrust/scan.h>
+#include <thrust/device_ptr.h>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -18,11 +20,53 @@
 #include "util.h"
 
 
+__device__ __inline__ int
+circleInBoxConservative(
+    float circleX, float circleY, float circleRadius,
+    float boxL, float boxR, float boxT, float boxB)
+{
+
+    // expand box by circle radius.  Test if circle center is in the
+    // expanded box.
+
+    if ( circleX >= (boxL - circleRadius) &&
+         circleX <= (boxR + circleRadius) &&
+         circleY >= (boxB - circleRadius) &&
+         circleY <= (boxT + circleRadius) ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+__device__ __inline__ int
+circleInBox(
+    float circleX, float circleY, float circleRadius,
+    float boxL, float boxR, float boxT, float boxB)
+{
+
+    // clamp circle center to box (finds the closest point on the box)
+    float closestX = (circleX > boxL) ? ((circleX < boxR) ? circleX : boxR) : boxL;
+    float closestY = (circleY > boxB) ? ((circleY < boxT) ? circleY : boxT) : boxB;
+
+    // is circle radius less than the distance to the closest point on
+    // the box?
+    float distX = closestX - circleX;
+    float distY = closestY - circleY;
+
+    if ( ((distX*distX) + (distY*distY)) <= (circleRadius*circleRadius) ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr BIN_SIZE = 16; 
+static constexpr int BIN_SIZE = 16; 
 
 // This stores the global constants
 struct GlobalConstants {
@@ -43,7 +87,8 @@ struct GlobalConstants {
     int binsX;
     int binsY;
     
-    int* 
+    int* BinCircCounts;
+    int* BinOffsets; 
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -476,11 +521,51 @@ __global__ void kernelRenderPixels(){
     *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
 
 }
+
+__global__ void kernelCalcCircleOverlaps(){
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  if(x >= cuConstRendererParams.numberOfCircles){return;}
+  float3 p = *(float3*)(&cuConstRendererParams.position[3*x]);
+  float rad = cuConstRendererParams.radius[x];
+  p.x = p.x*cuConstRendererParams.imageWidth; 
+  p.y = p.y*cuConstRendererParams.imageHeight; 
+  rad = rad * cuConstRendererParams.imageWidth;
+  int minBinX = static_cast<int>((p.x - rad) / BIN_SIZE);
+  int maxBinX = static_cast<int>((p.x + rad) / BIN_SIZE);
+  int minBinY = static_cast<int>((p.y - rad) / BIN_SIZE);
+  int maxBinY = static_cast<int>((p.y + rad) / BIN_SIZE);
+
+  // 5. Clamp to ensure we don't go out of array bounds
+  minBinX = max(0, min(cuConstRendererParams.binsX - 1, minBinX));
+  maxBinX = max(0, min(cuConstRendererParams.binsX - 1, maxBinX));
+  minBinY = max(0, min(cuConstRendererParams.binsY - 1, minBinY));
+  maxBinY = max(0, min(cuConstRendererParams.binsY - 1, maxBinY));
+
+  // 6. Only loop over the bins the circle actually overlaps
+  for (int j = minBinY; j <= maxBinY; j++) {
+    for (int i = minBinX; i <= maxBinX; i++) {
+      // printf("Checking bin #%d,%d\n",i,j );
+      float boxL = i * BIN_SIZE;
+      float boxR = (i + 1) * BIN_SIZE;
+      float boxB = j * BIN_SIZE;
+      float boxT = (j + 1) * BIN_SIZE;
+
+      if (circleInBox(p.x, p.y , rad, boxL, boxR, boxT, boxB)) {
+        int binIdx = j * cuConstRendererParams.binsX + i;
+        printf("Circle: (%.2f,%.2f,%.2f) determined to be in bin: (%d,%d) in image size: (%d,%d)\n",
+            p.x,p.y,rad,i,j,cuConstRendererParams.imageWidth,cuConstRendererParams.imageHeight);
+        // Use atomicAdd because multiple circles might hit the same bin
+        atomicAdd(&cuConstRendererParams.BinCircCounts[binIdx], 1);
+      }
+   }
+  }
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
 CudaRenderer::CudaRenderer() {
     image = NULL;
+
 
     numberOfCircles = 0;
     position = NULL;
@@ -493,10 +578,10 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
+    cudaDeviceBinCircCounts = NULL;
+    cudaDeviceBinOffsets = NULL;
 }
-
 CudaRenderer::~CudaRenderer() {
-
     if (image) {
         delete image;
     }
@@ -514,6 +599,14 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
+    }
+    
+    if (cudaDeviceBinCircCounts) {
+        cudaFree(cudaDeviceBinCircCounts);
+    }
+    
+    if (cudaDeviceBinOffsets) {
+        cudaFree(cudaDeviceBinOffsets);
     }
 }
 
@@ -574,6 +667,9 @@ CudaRenderer::setup() {
         printf("---------------------------------------------------------\n");
     }
     
+    int bX = ((image->width) + BIN_SIZE - 1) / BIN_SIZE ;
+    int bY = ((image->height) + BIN_SIZE - 1) / BIN_SIZE ;
+
     // By this time the scene should be loaded.  Now copy all the key
     // data structures into device memory so they are accessible to
     // CUDA kernels
@@ -586,6 +682,10 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numberOfCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numberOfCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
+    cudaMalloc(&cudaDeviceBinCircCounts, sizeof(int) * bX * bY);
+    cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * bX * bY);
+    cudaMalloc(&cudaDeviceBinOffsets, sizeof(int) * bX * bY);
+    cudaMemset(cudaDeviceBinOffsets, 0, sizeof(int) * bX * bY);
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
@@ -610,6 +710,11 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+    params.binsX = bX;
+    params.binsY = bY;
+    params.BinCircCounts = cudaDeviceBinCircCounts;
+    params.BinOffsets = cudaDeviceBinOffsets;
+
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -696,16 +801,31 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-    // 256 threads per block is a healthy number
+  int bX = ((image->width) + BIN_SIZE - 1) / BIN_SIZE;
+  int bY = ((image->height) + BIN_SIZE - 1) / BIN_SIZE;
+  int totalBins = bX * bY;
+  cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
+  // 256 threads per block is a healthy number
     // dim3 blockDim(256, 1);
     // dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
     //
     // kernelRenderCircles<<<gridDim, blockDim>>>();
     // cudaDeviceSynchronize();
     //Fits in register file, warp aligned  -- Also see 653:654
-    dim3 blockDim(16,16);
-    dim3 gridDim((image->width + blockDim.x -1 ) / blockDim.x , (image->height + blockDim.y -1)  / blockDim.y );
-    kernelRenderPixels<<<gridDim, blockDim>>>();
+    dim3 blockDim(3);
+    dim3 gridDim(1);
+    kernelCalcCircleOverlaps<<<gridDim,blockDim>>>();
     cudaDeviceSynchronize();
+    thrust::exclusive_scan(thrust::device, 
+        cudaDeviceBinCircCounts, 
+        cudaDeviceBinCircCounts + totalBins, 
+        cudaDeviceBinOffsets);
+    // thrust::device_ptr<int> d_counts(cudaDeviceBinCircCounts);
+    // thrust::device_ptr<int> d_offsets(cudaDeviceBinOffsets);
+    //
+    // // 2. Perform the prefix sum (Exclusive Scan)
+    // thrust::exclusive_scan(d_counts, d_counts + totalBins, d_offsets);
+    // kernelRenderPixels<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
 
 }
