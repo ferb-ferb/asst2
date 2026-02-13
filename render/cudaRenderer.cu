@@ -22,6 +22,8 @@
 // All cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
 
+static constexpr BIN_SIZE = 16; 
+
 // This stores the global constants
 struct GlobalConstants {
 
@@ -37,6 +39,11 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+
+    int binsX;
+    int binsY;
+    
+    int* 
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -433,6 +440,42 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+__global__ void kernelRenderPixels(){
+  int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+  int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+  
+  if(pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight){
+    return;
+  }
+  //compute index of this pixel in image data array (r,g,b,a) -> 4 * 
+  int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+  float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+  // float4 pixelColor = make_float4(1.f,1.f,1.f,1.f); 
+  float invWidth = 1.f/cuConstRendererParams.imageWidth;
+  float invHeight = 1.f/cuConstRendererParams.imageHeight;
+
+  float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),  //Got from line 428-429 directly above
+    invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+  //For each circle in the list
+  for(int i = 0; i < cuConstRendererParams.numberOfCircles; i++){
+    //Compute Potision and radius 
+    float3 p = *(float3*)(&cuConstRendererParams.position[3*i]);
+    float rad = cuConstRendererParams.radius[i];
+    //Check if this pixel is in the circle
+    float diffx = p.x - pixelCenterNorm.x;
+    float diffy = p.y - pixelCenterNorm.y;
+    float pixelsDist = diffx*diffx + diffy*diffy;
+    float maxDist = rad*rad;
+    if(pixelsDist <= maxDist){
+      //If it is, shade the pixel
+      shadePixel(pixelCenterNorm,p,&pixelColor, i);
+    }
+  }
+   //Write float4 to offset to offset + 3 in one instruction
+    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
+
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -654,9 +697,15 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
-
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
+    //
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
+    //Fits in register file, warp aligned  -- Also see 653:654
+    dim3 blockDim(16,16);
+    dim3 gridDim((image->width + blockDim.x -1 ) / blockDim.x , (image->height + blockDim.y -1)  / blockDim.y );
+    kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
+
 }
