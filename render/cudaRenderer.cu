@@ -89,6 +89,7 @@ struct GlobalConstants {
     
     int* BinCircCounts;
     int* BinOffsets; 
+    int* LargeCirc;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -485,42 +486,121 @@ __global__ void kernelRenderCircles() {
     }
 }
 
-__global__ void kernelRenderPixels(){
-  int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-  int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
-  
-  if(pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight){
-    return;
-  }
-  //compute index of this pixel in image data array (r,g,b,a) -> 4 * 
-  int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
-  float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
-  // float4 pixelColor = make_float4(1.f,1.f,1.f,1.f); 
-  float invWidth = 1.f/cuConstRendererParams.imageWidth;
-  float invHeight = 1.f/cuConstRendererParams.imageHeight;
 
-  float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),  //Got from line 428-429 directly above
-    invHeight * (static_cast<float>(pixelY) + 0.5f));
+__global__ void kernelRenderPixels(int totalEntries) {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-  //For each circle in the list
-  for(int i = 0; i < cuConstRendererParams.numberOfCircles; i++){
-    //Compute Potision and radius 
-    float3 p = *(float3*)(&cuConstRendererParams.position[3*i]);
-    float rad = cuConstRendererParams.radius[i];
-    //Check if this pixel is in the circle
-    float diffx = p.x - pixelCenterNorm.x;
-    float diffy = p.y - pixelCenterNorm.y;
-    float pixelsDist = diffx*diffx + diffy*diffy;
-    float maxDist = rad*rad;
-    if(pixelsDist <= maxDist){
-      //If it is, shade the pixel
-      shadePixel(pixelCenterNorm,p,&pixelColor, i);
+    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
+        return;
+
+    int binX = pixelX / BIN_SIZE;
+    int binY = pixelY / BIN_SIZE;
+
+    int binsX = cuConstRendererParams.binsX;
+    int binsY = cuConstRendererParams.binsY;
+    int totalBins = binsX * binsY;
+
+    int binIdx = binY * binsX + binX;
+
+    int start = cuConstRendererParams.BinOffsets[binIdx];
+    int end = (binIdx == totalBins - 1) ? totalEntries : cuConstRendererParams.BinOffsets[binIdx + 1];
+
+    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f)
+    );
+
+    for (int i = start; i < end; i++) {
+        int circleIdx = cuConstRendererParams.LargeCirc[i];
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+        float r = cuConstRendererParams.radius[circleIdx];
+
+        float dx = pixelCenterNorm.x - p.x;
+        float dy = pixelCenterNorm.y - p.y;
+
+        if (dx*dx + dy*dy <= r*r) {
+            shadePixel(pixelCenterNorm, p, &pixelColor, circleIdx);
+        }
     }
-  }
-   //Write float4 to offset to offset + 3 in one instruction
-    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
 
+    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
 }
+
+// __global__ void kernelRenderPixels(){
+//   int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+//   int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+//
+//   if(pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight){
+//     return;
+//   }
+//   int binX = pixelX / BIN_SIZE;
+//   int binY = pixelY / BIN_SIZE;
+//
+//   int binsX = (imageWidth + BIN_SIZE - 1) / BIN_SIZE;
+//   int totalBins = binsX * ((imageHeight + BIN_SIZE - 1) / BIN_SIZE);
+//
+//   int binIdx = binY * binsX + binX;
+//
+//   int start = cuConstRendererParams.BinOffsets[binIdx];
+//
+//   int end;
+//   if (binIdx == totalBins - 1) {
+//     // last bin
+//     end = cuConstRendererParams.totalEntries;  // we'll pass this in
+//   } else {
+//     end = cuConstRendererParams.BinOffsets[binIdx + 1];
+//   }
+//
+//   //compute index of this pixel in image data array (r,g,b,a) -> 4 * 
+//   int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+//   float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+//   // float4 pixelColor = make_float4(1.f,1.f,1.f,1.f); 
+//   float invWidth = 1.f/cuConstRendererParams.imageWidth;
+//   float invHeight = 1.f/cuConstRendererParams.imageHeight;
+//
+//   float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),  //Got from line 428-429 directly above
+//     invHeight * (static_cast<float>(pixelY) + 0.5f));
+//
+//
+//   for (int i = start; i < end; i++) {
+//     int circleIdx = cuConstRendererParams.LargeCirc[i];
+//
+//     float3 p = *(float3*)(&position[3 * circleIdx]);
+//     float  r = radius[circleIdx];
+//
+//     float dx = pixelCenterNorm.x - p.x;
+//     float dy = pixelCenterNorm.y - p.y;
+//
+//     if (dx*dx + dy*dy <= r*r) {
+//       shadePixel(pixelCenterNorm,p,&pixelColor, circleIdx);
+//     }
+//   }
+//
+//   // //For each circle in the list
+//   // for(int i = 0; i < cuConstRendererParams.numberOfCircles; i++){
+//   //   //Compute Potision and radius 
+//   //   float3 p = *(float3*)(&cuConstRendererParams.position[3*i]);
+//   //   float rad = cuConstRendererParams.radius[i];
+//   //   //Check if this pixel is in the circle
+//   //   float diffx = p.x - pixelCenterNorm.x;
+//   //   float diffy = p.y - pixelCenterNorm.y;
+//   //   float pixelsDist = diffx*diffx + diffy*diffy;
+//   //   float maxDist = rad*rad;
+//   //   if(pixelsDist <= maxDist){
+//   //     //If it is, shade the pixel
+//   //     shadePixel(pixelCenterNorm,p,&pixelColor, i);
+//   //   }
+//   // }
+//    //Write float4 to offset to offset + 3 in one instruction
+//     *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
+//
+// }
 
 __global__ void kernelCalcCircleOverlaps(){
   int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -560,6 +640,46 @@ __global__ void kernelCalcCircleOverlaps(){
    }
   }
 }
+
+
+__global__ void kernelPopulateLargeCirc() {
+    int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (circleIdx >= cuConstRendererParams.numberOfCircles) return;
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+    float r = cuConstRendererParams.radius[circleIdx];
+    p.x = p.x*cuConstRendererParams.imageWidth; 
+    p.y = p.y*cuConstRendererParams.imageHeight; 
+    r = r * cuConstRendererParams.imageWidth;
+    int minBinX = static_cast<int>((p.x - r) / BIN_SIZE);
+    int maxBinX = static_cast<int>((p.x + r) / BIN_SIZE);
+    int minBinY = static_cast<int>((p.y - r) / BIN_SIZE);
+    int maxBinY = static_cast<int>((p.y + r) / BIN_SIZE);
+
+    // Clamp to valid bin indices
+    minBinX = max(0, min(cuConstRendererParams.binsX - 1, minBinX));
+    maxBinX = max(0, min(cuConstRendererParams.binsX - 1, maxBinX));
+    minBinY = max(0, min(cuConstRendererParams.binsY - 1, minBinY));
+    maxBinY = max(0, min(cuConstRendererParams.binsY - 1, maxBinY));
+
+    for (int by = minBinY; by <= maxBinY; ++by) {
+        for (int bx = minBinX; bx <= maxBinX; ++bx) {
+            int binIdx = by * cuConstRendererParams.binsX + bx;
+
+            float boxL = bx * BIN_SIZE;
+            float boxR = (bx + 1) * BIN_SIZE;
+            float boxB = by * BIN_SIZE;
+            float boxT = (by + 1) * BIN_SIZE;
+
+            if (circleInBox(p.x, p.y, r, boxL, boxR, boxT, boxB)) {
+                int writeIdx = cuConstRendererParams.BinOffsets[binIdx] + 
+                               atomicAdd(&cuConstRendererParams.BinCircCounts[binIdx], 1);
+                cuConstRendererParams.LargeCirc[writeIdx] = circleIdx;
+            }
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -580,6 +700,7 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceImageData = NULL;
     cudaDeviceBinCircCounts = NULL;
     cudaDeviceBinOffsets = NULL;
+    cudaLargeArrayCirc = NULL;
 }
 CudaRenderer::~CudaRenderer() {
     if (image) {
@@ -607,6 +728,9 @@ CudaRenderer::~CudaRenderer() {
     
     if (cudaDeviceBinOffsets) {
         cudaFree(cudaDeviceBinOffsets);
+    }
+    if (cudaLargeArrayCirc) {
+        cudaFree(cudaLargeArrayCirc);
     }
 }
 
@@ -686,6 +810,7 @@ CudaRenderer::setup() {
     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * bX * bY);
     cudaMalloc(&cudaDeviceBinOffsets, sizeof(int) * bX * bY);
     cudaMemset(cudaDeviceBinOffsets, 0, sizeof(int) * bX * bY);
+    cudaMalloc(&cudaLargeArrayCirc, sizeof(int) * numberOfCircles * bX * bY);
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
@@ -714,6 +839,7 @@ CudaRenderer::setup() {
     params.binsY = bY;
     params.BinCircCounts = cudaDeviceBinCircCounts;
     params.BinOffsets = cudaDeviceBinOffsets;
+    params.LargeCirc = cudaLargeArrayCirc;
 
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
@@ -820,11 +946,31 @@ CudaRenderer::render() {
         cudaDeviceBinCircCounts, 
         cudaDeviceBinCircCounts + totalBins, 
         cudaDeviceBinOffsets);
-    // thrust::device_ptr<int> d_counts(cudaDeviceBinCircCounts);
-    // thrust::device_ptr<int> d_offsets(cudaDeviceBinOffsets);
-    //
-    // // 2. Perform the prefix sum (Exclusive Scan)
-    // thrust::exclusive_scan(d_counts, d_counts + totalBins, d_offsets);
+    cudaDeviceSynchronize();
+    cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * bX * bY);
+    kernelPopulateLargeCirc<<<gridDim, blockDim>>>();
+    cudaDeviceSynchronize();
+    int totalEntries = 4655;
+    dim3 b1(16,16);
+    dim3 g1(
+        (image->width + b1.x - 1) / b1.x,
+        (image->height + b1.y - 1) / b1.y
+        );
+
+    kernelRenderPixels<<<g1, b1>>>(totalEntries);
+    cudaDeviceSynchronize();
+    // int* sorted = (int*)malloc(numberOfCircles*totalBins* sizeof(int));
+    // cudaMemcpy(sorted, cudaLargeArrayCirc,numberOfCircles* totalBins*sizeof(int),cudaMemcpyDeviceToHost);
+    // int* offsets = (int*)malloc(totalBins* sizeof(int));
+    // cudaMemcpy(offsets, cudaDeviceBinOffsets,totalBins*sizeof(int),cudaMemcpyDeviceToHost);
+    // for(int i = 0; i < totalBins; i++){
+    //   printf("offsets[%d] = %d\n", i, offsets[i]);
+    // }
+    // for(int i = 0; i < numberOfCircles*totalBins; i++){
+    //   printf("Largearr[%d] = %d\n", i, sorted[i]);
+    // }
+    // free(offsets);
+    // free(sorted);
     // kernelRenderPixels<<<gridDim, blockDim>>>();
     // cudaDeviceSynchronize();
 

@@ -29,6 +29,7 @@ private:
     int* cudaDeviceBinCircCounts;
     int* cudaDeviceBinOffsets;
 
+    int* cudaLargeArrayCirc;
 
 public:
 
