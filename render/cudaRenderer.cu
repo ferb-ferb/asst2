@@ -680,6 +680,34 @@ __global__ void kernelPopulateLargeCirc() {
     }
 }
 
+// kernelSortBins -- (CUDA device code)
+//
+// Sorts the circle indices within each bin's segment of the LargeCirc array
+// in ascending order to strictly preserve the required input rendering order.
+__global__ void kernelSortBins(int totalBins, int totalEntries) {
+    int binIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (binIdx >= totalBins) return;
+
+    int start = cuConstRendererParams.BinOffsets[binIdx];
+    int end = (binIdx == totalBins - 1) ? 
+              totalEntries : 
+              cuConstRendererParams.BinOffsets[binIdx + 1];
+
+    // Simple Insertion Sort for the bin's segment
+    // (Highly efficient for the small number of circles per bin)
+    for (int i = start + 1; i < end; i++) {
+        int key = cuConstRendererParams.LargeCirc[i];
+        int j = i - 1;
+        
+        // Shift elements greater than key to the right
+        while (j >= start && cuConstRendererParams.LargeCirc[j] > key) {
+            cuConstRendererParams.LargeCirc[j + 1] = cuConstRendererParams.LargeCirc[j];
+            j--;
+        }
+        cuConstRendererParams.LargeCirc[j + 1] = key;
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -927,51 +955,99 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-  int bX = ((image->width) + BIN_SIZE - 1) / BIN_SIZE;
-  int bY = ((image->height) + BIN_SIZE - 1) / BIN_SIZE;
-  int totalBins = bX * bY;
-  cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
-  // 256 threads per block is a healthy number
-    // dim3 blockDim(256, 1);
-    // dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
-    //
-    // kernelRenderCircles<<<gridDim, blockDim>>>();
-    // cudaDeviceSynchronize();
-    //Fits in register file, warp aligned  -- Also see 653:654
-    dim3 blockDim(256);
-    dim3 gridDim((numberOfCircles + 255) / 256);
-    kernelCalcCircleOverlaps<<<gridDim,blockDim>>>();
-    cudaDeviceSynchronize();
-    thrust::exclusive_scan(thrust::device, 
-        cudaDeviceBinCircCounts, 
-        cudaDeviceBinCircCounts + totalBins, 
-        cudaDeviceBinOffsets);
-    cudaDeviceSynchronize();
-    cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * bX * bY);
-    kernelPopulateLargeCirc<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
-    int totalEntries = 4655;
-    dim3 b1(16,16);
-    dim3 g1(
-        (image->width + b1.x - 1) / b1.x,
-        (image->height + b1.y - 1) / b1.y
-        );
+    int bX = ((image->width) + BIN_SIZE - 1) / BIN_SIZE;
+    int bY = ((image->height) + BIN_SIZE - 1) / BIN_SIZE;
+    int totalBins = bX * bY;
 
-    kernelRenderPixels<<<g1, b1>>>(totalEntries);
-    cudaDeviceSynchronize();
-    // int* sorted = (int*)malloc(numberOfCircles*totalBins* sizeof(int));
-    // cudaMemcpy(sorted, cudaLargeArrayCirc,numberOfCircles* totalBins*sizeof(int),cudaMemcpyDeviceToHost);
-    // int* offsets = (int*)malloc(totalBins* sizeof(int));
-    // cudaMemcpy(offsets, cudaDeviceBinOffsets,totalBins*sizeof(int),cudaMemcpyDeviceToHost);
-    // for(int i = 0; i < totalBins; i++){
-    //   printf("offsets[%d] = %d\n", i, offsets[i]);
-    // }
-    // for(int i = 0; i < numberOfCircles*totalBins; i++){
-    //   printf("Largearr[%d] = %d\n", i, sorted[i]);
-    // }
-    // free(offsets);
-    // free(sorted);
-    // kernelRenderPixels<<<gridDim, blockDim>>>();
-    // cudaDeviceSynchronize();
+    // 1. Clear the bin counts
+    cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
 
+    // 2. Calculate overlaps
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (numberOfCircles + threadsPerBlock - 1) / threadsPerBlock;
+    kernelCalcCircleOverlaps<<<blocksPerGrid, threadsPerBlock>>>();
+    cudaDeviceSynchronize();
+
+    // 3. Scan to get offsets
+    thrust::device_ptr<int> dev_counts(cudaDeviceBinCircCounts);
+    thrust::device_ptr<int> dev_offsets(cudaDeviceBinOffsets);
+    thrust::exclusive_scan(dev_counts, dev_counts + totalBins, dev_offsets);
+
+    // 4. Reset counts for population
+    cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
+
+    // 5. Populate the bins (Out of order due to atomics)
+    kernelPopulateLargeCirc<<<blocksPerGrid, threadsPerBlock>>>();
+    cudaDeviceSynchronize();
+
+    // Calculate total entries
+    int lastOffset, lastCount;
+    cudaMemcpy(&lastOffset, &cudaDeviceBinOffsets[totalBins - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&lastCount, &cudaDeviceBinCircCounts[totalBins - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    int totalEntries = lastOffset + lastCount;
+
+    // ---------------------------------------------------------
+    // 6. RESTORE ORDER: Sort each bin's sub-array
+    // ---------------------------------------------------------
+    int sortThreads = 256;
+    int sortBlocks = (totalBins + sortThreads - 1) / sortThreads;
+    kernelSortBins<<<sortBlocks, sortThreads>>>(totalBins, totalEntries);
+    cudaDeviceSynchronize();
+
+    // 7. Render pixels
+    dim3 pixelBlockDim(BIN_SIZE, BIN_SIZE);
+    dim3 pixelGridDim(bX, bY);
+    kernelRenderPixels<<<pixelGridDim, pixelBlockDim>>>(totalEntries);
+    cudaDeviceSynchronize();
 }
+
+// void
+// CudaRenderer::render() {
+//   int bX = ((image->width) + BIN_SIZE - 1) / BIN_SIZE;
+//   int bY = ((image->height) + BIN_SIZE - 1) / BIN_SIZE;
+//   int totalBins = bX * bY;
+//   cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
+//   // 256 threads per block is a healthy number
+//     // dim3 blockDim(256, 1);
+//     // dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
+//     //
+//     // kernelRenderCircles<<<gridDim, blockDim>>>();
+//     // cudaDeviceSynchronize();
+//     //Fits in register file, warp aligned  -- Also see 653:654
+//     dim3 blockDim(256);
+//     dim3 gridDim((numberOfCircles + 255) / 256);
+//     kernelCalcCircleOverlaps<<<gridDim,blockDim>>>();
+//     cudaDeviceSynchronize();
+//     thrust::exclusive_scan(thrust::device, 
+//         cudaDeviceBinCircCounts, 
+//         cudaDeviceBinCircCounts + totalBins, 
+//         cudaDeviceBinOffsets);
+//     cudaDeviceSynchronize();
+//     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * bX * bY);
+//     kernelPopulateLargeCirc<<<gridDim, blockDim>>>();
+//     cudaDeviceSynchronize();
+//     int totalEntries = 4655;
+//     dim3 b1(16,16);
+//     dim3 g1(
+//         (image->width + b1.x - 1) / b1.x,
+//         (image->height + b1.y - 1) / b1.y
+//         );
+//
+//     kernelRenderPixels<<<g1, b1>>>(totalEntries);
+//     cudaDeviceSynchronize();
+//     // int* sorted = (int*)malloc(numberOfCircles*totalBins* sizeof(int));
+//     // cudaMemcpy(sorted, cudaLargeArrayCirc,numberOfCircles* totalBins*sizeof(int),cudaMemcpyDeviceToHost);
+//     // int* offsets = (int*)malloc(totalBins* sizeof(int));
+//     // cudaMemcpy(offsets, cudaDeviceBinOffsets,totalBins*sizeof(int),cudaMemcpyDeviceToHost);
+//     // for(int i = 0; i < totalBins; i++){
+//     //   printf("offsets[%d] = %d\n", i, offsets[i]);
+//     // }
+//     // for(int i = 0; i < numberOfCircles*totalBins; i++){
+//     //   printf("Largearr[%d] = %d\n", i, sorted[i]);
+//     // }
+//     // free(offsets);
+//     // free(sorted);
+//     // kernelRenderPixels<<<gridDim, blockDim>>>();
+//     // cudaDeviceSynchronize();
+//
+// }

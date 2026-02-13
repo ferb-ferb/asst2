@@ -1,5 +1,6 @@
 Rendering to 1150x1150 image
-Loaded scene with 3 circles
+Loaded scene with 1217 circles
+Loaded scene with 1217 circles
 ---------------------------------------------------------
 Initializing CUDA for CudaRenderer
 Found 1 CUDA devices
@@ -11,10 +12,12 @@ Device 0: NVIDIA GeForce RTX 2080
 WARNING: You're not running on a fast GPU, please consider using NVIDIA RTX 2080.
 ---------------------------------------------------------
 
-Running benchmark, 4 frames, beginning at frame 0 ...
-Clear:    0.0622 ms
-Advance:  0.0005 ms
-Render:   0.1306 ms
-Total:    0.1933 ms
+Running benchmark, 1 frames, beginning at frame 0 ...
+Copying image data from device
+***************** Correctness check passed **************************
+Clear:    0.1029 ms
+Advance:  0.0007 ms
+Render:   0.3189 ms
+Total:    0.4225 ms
 
-Overall:  0.0008 sec (note units are seconds)
+Overall:  0.0288 sec (note units are seconds)
