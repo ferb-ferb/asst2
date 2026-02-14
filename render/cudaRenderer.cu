@@ -487,6 +487,8 @@ __global__ void kernelRenderCircles() {
         }
     }
 }
+
+
 __global__ void kernelRenderPixels(int totalEntries) {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
