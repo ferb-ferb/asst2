@@ -1,4 +1,5 @@
 #include <string>
+#include <cub/cub.cuh>
 #include <thrust/execution_policy.h>
 #include <algorithm>
 #define _USE_MATH_DEFINES
@@ -638,6 +639,71 @@ __global__ void kernelSortBins(int totalBins, int totalEntries) {
     }
 }
 
+
+// Render a single circle across all its pixels (no race conditions)
+__global__ void kernelRenderSingleCircle(int circleIdx) {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (pixelX >= cuConstRendererParams.imageWidth || 
+        pixelY >= cuConstRendererParams.imageHeight)
+        return;
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+    float r = cuConstRendererParams.radius[circleIdx];
+    
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f)
+    );
+    
+    float dx = pixelCenterNorm.x - p.x;
+    float dy = pixelCenterNorm.y - p.y;
+    
+    if (dx*dx + dy*dy <= r*r) {
+        int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[offset]);
+        shadePixel(pixelCenterNorm, p, imgPtr, circleIdx);
+    }
+}
+
+// For slightly larger scenes - each pixel checks all circles in order
+__global__ void kernelRenderPixelsSimple() {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (pixelX >= cuConstRendererParams.imageWidth || 
+        pixelY >= cuConstRendererParams.imageHeight)
+        return;
+
+    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f)
+    );
+
+    // Check all circles in order
+    for (int i = 0; i < cuConstRendererParams.numberOfCircles; i++) {
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * i]);
+        float r = cuConstRendererParams.radius[i];
+
+        float dx = pixelCenterNorm.x - p.x;
+        float dy = pixelCenterNorm.y - p.y;
+
+        if (dx*dx + dy*dy <= r*r) {
+            shadePixel(pixelCenterNorm, p, &pixelColor, i);
+        }
+    }
+
+    *(float4*)(&cuConstRendererParams.imageData[offset]) = pixelColor;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -766,8 +832,10 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
     cudaMalloc(&cudaDeviceBinCircCounts, sizeof(int) * bX * bY);
     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * bX * bY);
-    cudaMalloc(&cudaDeviceBinOffsets, sizeof(int) * bX * bY);
-    cudaMemset(cudaDeviceBinOffsets, 0, sizeof(int) * bX * bY);
+    // cudaMalloc(&cudaDeviceBinOffsets, sizeof(int) * bX * bY);
+    // cudaMemset(cudaDeviceBinOffsets, 0, sizeof(int) * bX * bY);
+    cudaMalloc(&cudaDeviceBinOffsets, sizeof(int) * (bX * bY + 1));  // +1 for end sentinel
+    cudaMemset(cudaDeviceBinOffsets, 0, sizeof(int) * (bX * bY + 1));
     cudaMalloc(&cudaLargeArrayCirc, sizeof(int) * numberOfCircles * bX * bY);
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
@@ -882,49 +950,76 @@ CudaRenderer::advanceAnimation() {
     }
     cudaDeviceSynchronize();
 }
-
-void
-CudaRenderer::render() {
+void CudaRenderer::render() {
+    // Ultra-fast path for very small scenes (like rgb with 3 circles)
+    if (numberOfCircles <= 100) {
+        dim3 blockDim(16, 16);
+        dim3 gridDim((image->width + 15) / 16, (image->height + 15) / 16);
+        
+        // Render circles one at a time in order - no race conditions
+        for (int i = 0; i < numberOfCircles; i++) {
+            kernelRenderSingleCircle<<<gridDim, blockDim>>>(i);
+        }
+        cudaDeviceSynchronize();
+        return;
+    }
+    
+    // Medium fast path for small-ish scenes  
+    if (numberOfCircles < 1000) {
+        dim3 blockDim(16, 16);
+        dim3 gridDim((image->width + 15) / 16, (image->height + 15) / 16);
+        kernelRenderPixelsSimple<<<gridDim, blockDim>>>();
+        cudaDeviceSynchronize();
+        return;
+    }
+    
+    // Your existing binning code for large scenes
     int bX = ((image->width) + BIN_SIZE - 1) / BIN_SIZE;
     int bY = ((image->height) + BIN_SIZE - 1) / BIN_SIZE;
     int totalBins = bX * bY;
 
-    // 1. Clear the bin counts
     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
 
-    // 2. Calculate overlaps
-    int threadsPerBlock = 16;
+    int threadsPerBlock = 256;
     int blocksPerGrid = (numberOfCircles + threadsPerBlock - 1) / threadsPerBlock;
     kernelCalcCircleOverlaps<<<blocksPerGrid, threadsPerBlock>>>();
     cudaDeviceSynchronize();
 
-    // 3. Scan to get offsets
     thrust::device_ptr<int> dev_counts(cudaDeviceBinCircCounts);
     thrust::device_ptr<int> dev_offsets(cudaDeviceBinOffsets);
     thrust::exclusive_scan(dev_counts, dev_counts + totalBins, dev_offsets);
 
-    // 4. Reset counts for population
     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
-
-    // 5. Populate the bins (Out of order due to atomics)
     kernelPopulateLargeCirc<<<blocksPerGrid, threadsPerBlock>>>();
     cudaDeviceSynchronize();
 
-    // Calculate total entries just for final bin sort and render
     int lastOffset, lastCount;
     cudaMemcpy(&lastOffset, &cudaDeviceBinOffsets[totalBins - 1], sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&lastCount, &cudaDeviceBinCircCounts[totalBins - 1], sizeof(int), cudaMemcpyDeviceToHost);
     int totalEntries = lastOffset + lastCount;
 
-    // ---------------------------------------------------------
-    // 6. RESTORE ORDER: Sort each bin's sub-array
-    // ---------------------------------------------------------
-    int sortThreads = 16;
-    int sortBlocks = (totalBins + sortThreads - 1) / sortThreads;
-    kernelSortBins<<<sortBlocks, sortThreads>>>(totalBins, totalEntries);
-    cudaDeviceSynchronize();
+    // Set the sentinel value for the last segment's end
+    cudaMemcpy(&cudaDeviceBinOffsets[totalBins], &totalEntries, sizeof(int), cudaMemcpyHostToDevice);
 
-    // 7. Render pixels
+    void* d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0;
+
+    cub::DeviceSegmentedSort::SortKeys(
+        d_temp_storage, temp_storage_bytes,
+        cudaLargeArrayCirc, cudaLargeArrayCirc, totalEntries,
+        totalBins, cudaDeviceBinOffsets, cudaDeviceBinOffsets + 1
+    );
+
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+
+    cub::DeviceSegmentedSort::SortKeys(
+        d_temp_storage, temp_storage_bytes,
+        cudaLargeArrayCirc, cudaLargeArrayCirc, totalEntries,
+        totalBins, cudaDeviceBinOffsets, cudaDeviceBinOffsets + 1
+    );
+
+    cudaFree(d_temp_storage);
+
     dim3 pixelBlockDim(BIN_SIZE, BIN_SIZE);
     dim3 pixelGridDim(bX, bY);
     kernelRenderPixels<<<pixelGridDim, pixelBlockDim>>>(totalEntries);
