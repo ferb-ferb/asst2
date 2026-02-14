@@ -893,7 +893,7 @@ CudaRenderer::render() {
     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
 
     // 2. Calculate overlaps
-    int threadsPerBlock = 256;
+    int threadsPerBlock = 16;
     int blocksPerGrid = (numberOfCircles + threadsPerBlock - 1) / threadsPerBlock;
     kernelCalcCircleOverlaps<<<blocksPerGrid, threadsPerBlock>>>();
     cudaDeviceSynchronize();
@@ -919,7 +919,7 @@ CudaRenderer::render() {
     // ---------------------------------------------------------
     // 6. RESTORE ORDER: Sort each bin's sub-array
     // ---------------------------------------------------------
-    int sortThreads = 256;
+    int sortThreads = 16;
     int sortBlocks = (totalBins + sortThreads - 1) / sortThreads;
     kernelSortBins<<<sortBlocks, sortThreads>>>(totalBins, totalEntries);
     cudaDeviceSynchronize();
