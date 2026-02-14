@@ -67,7 +67,8 @@ circleInBox(
 // All cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr int BIN_SIZE = 16; 
+static constexpr int BIN_SIZE = 32; // Your new bin size
+static constexpr int RENDER_BLOCK_SIZE = 16; // Threads per block dimension
 
 // This stores the global constants
 struct GlobalConstants {
@@ -486,8 +487,6 @@ __global__ void kernelRenderCircles() {
         }
     }
 }
-
-
 __global__ void kernelRenderPixels(int totalEntries) {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
@@ -497,18 +496,11 @@ __global__ void kernelRenderPixels(int totalEntries) {
 
     int binX = pixelX / BIN_SIZE;
     int binY = pixelY / BIN_SIZE;
-
-    int binsX = cuConstRendererParams.binsX;
-    int binsY = cuConstRendererParams.binsY;
-    int totalBins = binsX * binsY;
-
-    int binIdx = binY * binsX + binX;
+    int binIdx = binY * cuConstRendererParams.binsX + binX;
 
     int start = cuConstRendererParams.BinOffsets[binIdx];
-    int end = (binIdx == totalBins - 1) ? totalEntries : cuConstRendererParams.BinOffsets[binIdx + 1];
-
-    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
-    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+    int end = (binIdx == cuConstRendererParams.binsX * cuConstRendererParams.binsY - 1) ? 
+              totalEntries : cuConstRendererParams.BinOffsets[binIdx + 1];
 
     float invWidth = 1.f / cuConstRendererParams.imageWidth;
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
@@ -517,6 +509,10 @@ __global__ void kernelRenderPixels(int totalEntries) {
         invHeight * (static_cast<float>(pixelY) + 0.5f)
     );
 
+    int offset = 4 * (pixelY * cuConstRendererParams.imageWidth + pixelX);
+    float4 pixelColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+
+    // Process circles
     for (int i = start; i < end; i++) {
         int circleIdx = cuConstRendererParams.LargeCirc[i];
         float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
@@ -972,8 +968,6 @@ void CudaRenderer::render() {
         cudaDeviceSynchronize();
         return;
     }
-    
-    // Your existing binning code for large scenes
     int bX = ((image->width) + BIN_SIZE - 1) / BIN_SIZE;
     int bY = ((image->height) + BIN_SIZE - 1) / BIN_SIZE;
     int totalBins = bX * bY;
@@ -983,22 +977,22 @@ void CudaRenderer::render() {
     int threadsPerBlock = 256;
     int blocksPerGrid = (numberOfCircles + threadsPerBlock - 1) / threadsPerBlock;
     kernelCalcCircleOverlaps<<<blocksPerGrid, threadsPerBlock>>>();
-    cudaDeviceSynchronize();
+    // NO SYNC HERE - Thrust will sync
 
     thrust::device_ptr<int> dev_counts(cudaDeviceBinCircCounts);
     thrust::device_ptr<int> dev_offsets(cudaDeviceBinOffsets);
     thrust::exclusive_scan(dev_counts, dev_counts + totalBins, dev_offsets);
+    // Thrust syncs internally
 
     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
     kernelPopulateLargeCirc<<<blocksPerGrid, threadsPerBlock>>>();
-    cudaDeviceSynchronize();
+    // NO SYNC HERE - cudaMemcpy will sync
 
     int lastOffset, lastCount;
     cudaMemcpy(&lastOffset, &cudaDeviceBinOffsets[totalBins - 1], sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&lastCount, &cudaDeviceBinCircCounts[totalBins - 1], sizeof(int), cudaMemcpyDeviceToHost);
     int totalEntries = lastOffset + lastCount;
 
-    // Set the sentinel value for the last segment's end
     cudaMemcpy(&cudaDeviceBinOffsets[totalBins], &totalEntries, sizeof(int), cudaMemcpyHostToDevice);
 
     void* d_temp_storage = nullptr;
@@ -1019,9 +1013,13 @@ void CudaRenderer::render() {
     );
 
     cudaFree(d_temp_storage);
+    // CUB syncs internally
+    dim3 pixelBlockDim(RENDER_BLOCK_SIZE, RENDER_BLOCK_SIZE); // 16x16 = 256 threads
+    dim3 pixelGridDim(
+        (image->width + RENDER_BLOCK_SIZE - 1) / RENDER_BLOCK_SIZE,
+        (image->height + RENDER_BLOCK_SIZE - 1) / RENDER_BLOCK_SIZE
+        );
 
-    dim3 pixelBlockDim(BIN_SIZE, BIN_SIZE);
-    dim3 pixelGridDim(bX, bY);
     kernelRenderPixels<<<pixelGridDim, pixelBlockDim>>>(totalEntries);
     cudaDeviceSynchronize();
 }
