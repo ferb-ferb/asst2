@@ -544,13 +544,13 @@ __global__ void kernelCalcCircleOverlaps(){
   int minBinY = static_cast<int>((p.y - rad) / BIN_SIZE);
   int maxBinY = static_cast<int>((p.y + rad) / BIN_SIZE);
 
-  // 5. Clamp to ensure we don't go out of array bounds
+  //Clamp to ensure we don't go out of array bounds
   minBinX = max(0, min(cuConstRendererParams.binsX - 1, minBinX));
   maxBinX = max(0, min(cuConstRendererParams.binsX - 1, maxBinX));
   minBinY = max(0, min(cuConstRendererParams.binsY - 1, minBinY));
   maxBinY = max(0, min(cuConstRendererParams.binsY - 1, maxBinY));
 
-  // 6. Only loop over the bins the circle actually overlaps
+  // Only loop over the bins the circle actually overlaps
   for (int j = minBinY; j <= maxBinY; j++) {
     for (int i = minBinX; i <= maxBinX; i++) {
       // printf("Checking bin #%d,%d\n",i,j );
@@ -609,36 +609,8 @@ __global__ void kernelPopulateLargeCirc() {
     }
 }
 
-// kernelSortBins -- (CUDA device code)
-//
-// Sorts the circle indices within each bin's segment of the LargeCirc array
-// in ascending order to strictly preserve the required input rendering order.
-__global__ void kernelSortBins(int totalBins, int totalEntries) {
-    int binIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (binIdx >= totalBins) return;
 
-    int start = cuConstRendererParams.BinOffsets[binIdx];
-    int end = (binIdx == totalBins - 1) ? 
-              totalEntries : 
-              cuConstRendererParams.BinOffsets[binIdx + 1];
-
-    // Simple Insertion Sort for the bin's segment
-    // (Highly efficient for the small number of circles per bin)
-    for (int i = start + 1; i < end; i++) {
-        int key = cuConstRendererParams.LargeCirc[i];
-        int j = i - 1;
-        
-        // Shift elements greater than key to the right
-        while (j >= start && cuConstRendererParams.LargeCirc[j] > key) {
-            cuConstRendererParams.LargeCirc[j + 1] = cuConstRendererParams.LargeCirc[j];
-            j--;
-        }
-        cuConstRendererParams.LargeCirc[j + 1] = key;
-    }
-}
-
-
-// Render a single circle across all its pixels (no race conditions)
+// Render a single circle across all its pixels
 __global__ void kernelRenderSingleCircle(int circleIdx) {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
@@ -667,7 +639,7 @@ __global__ void kernelRenderSingleCircle(int circleIdx) {
     }
 }
 
-// For slightly larger scenes - each pixel checks all circles in order
+// For slightly larger scenes
 __global__ void kernelRenderPixelsSimple() {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
@@ -949,12 +921,12 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 void CudaRenderer::render() {
-    // Ultra-fast path for very small scenes (like rgb with 3 circles)
+    // for very small number of circles 
     if (numberOfCircles <= 100) {
         dim3 blockDim(16, 16);
         dim3 gridDim((image->width + 15) / 16, (image->height + 15) / 16);
         
-        // Render circles one at a time in order - no race conditions
+        // serially 
         for (int i = 0; i < numberOfCircles; i++) {
             kernelRenderSingleCircle<<<gridDim, blockDim>>>(i);
         }
@@ -962,7 +934,7 @@ void CudaRenderer::render() {
         return;
     }
     
-    // Medium fast path for small-ish scenes  
+    // A simple kernel for medium number of circles 
     if (numberOfCircles < 1000) {
         dim3 blockDim(16, 16);
         dim3 gridDim((image->width + 15) / 16, (image->height + 15) / 16);
@@ -979,16 +951,16 @@ void CudaRenderer::render() {
     int threadsPerBlock = 256;
     int blocksPerGrid = (numberOfCircles + threadsPerBlock - 1) / threadsPerBlock;
     kernelCalcCircleOverlaps<<<blocksPerGrid, threadsPerBlock>>>();
-    // NO SYNC HERE - Thrust will sync
+    //implicit thrust sync 
 
     thrust::device_ptr<int> dev_counts(cudaDeviceBinCircCounts);
     thrust::device_ptr<int> dev_offsets(cudaDeviceBinOffsets);
     thrust::exclusive_scan(dev_counts, dev_counts + totalBins, dev_offsets);
-    // Thrust syncs internally
+    // thrust sync 
 
     cudaMemset(cudaDeviceBinCircCounts, 0, sizeof(int) * totalBins);
     kernelPopulateLargeCirc<<<blocksPerGrid, threadsPerBlock>>>();
-    // NO SYNC HERE - cudaMemcpy will sync
+    // memcpy will sync 
 
     int lastOffset, lastCount;
     cudaMemcpy(&lastOffset, &cudaDeviceBinOffsets[totalBins - 1], sizeof(int), cudaMemcpyDeviceToHost);
@@ -1015,8 +987,8 @@ void CudaRenderer::render() {
     );
 
     cudaFree(d_temp_storage);
-    // CUB syncs internally
-    dim3 pixelBlockDim(RENDER_BLOCK_SIZE, RENDER_BLOCK_SIZE); // 16x16 = 256 threads
+    // cub syncs internally
+    dim3 pixelBlockDim(RENDER_BLOCK_SIZE, RENDER_BLOCK_SIZE); // 16x16 = 256 threads -> one thread block = 1 bin 
     dim3 pixelGridDim(
         (image->width + RENDER_BLOCK_SIZE - 1) / RENDER_BLOCK_SIZE,
         (image->height + RENDER_BLOCK_SIZE - 1) / RENDER_BLOCK_SIZE
